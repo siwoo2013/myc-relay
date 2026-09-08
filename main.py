@@ -5,36 +5,53 @@ from collections import defaultdict
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="Living Relay V1.5")
-TOKEN = os.getenv("CCTV_TOKEN", "change-me")
+app = FastAPI(title="Living Relay V1.5.12 MultiToken")
 
-senders: dict[str, WebSocket] = {}
-sender_names: dict[str, str] = {}
-viewers = defaultdict(set)
-directories: set[WebSocket] = set()
+raw_tokens = os.getenv("CCTV_TOKENS", "").strip()
+if raw_tokens:
+    ALLOWED_TOKENS = {t.strip() for t in raw_tokens.split(",") if t.strip()}
+else:
+    legacy = os.getenv("CCTV_TOKEN", "").strip()
+    ALLOWED_TOKENS = {legacy} if legacy else set()
+
+senders = defaultdict(dict)          # token -> {device: websocket}
+sender_names = defaultdict(dict)     # token -> {device: name}
+viewers = defaultdict(lambda: defaultdict(set))  # token -> device -> viewers
+directories = defaultdict(set)      # token -> directory sockets
 lock = asyncio.Lock()
 
 @app.get("/")
 async def root():
-    return JSONResponse({"ok": True, "service": "Living Relay V1.5", "online": len(senders)})
+    online = sum(len(v) for v in senders.values())
+    return JSONResponse({
+        "ok": True,
+        "service": "Living Relay V1.5.12 MultiToken",
+        "online": online,
+        "token_groups": len(ALLOWED_TOKENS),
+    })
 
-async def directory_payload():
+async def directory_payload(token: str):
     devices = [
-        {"id": device, "name": sender_names.get(device, device)}
-        for device in sorted(senders.keys())
+        {"id": device, "name": sender_names[token].get(device, device)}
+        for device in sorted(senders[token].keys())
     ]
-    return json.dumps({"type": "device_list", "devices": devices}, ensure_ascii=False)
+    return json.dumps(
+        {"type": "device_list", "devices": devices},
+        ensure_ascii=False
+    )
 
-async def broadcast_directory():
-    payload = await directory_payload()
+async def broadcast_directory(token: str):
+    payload = await directory_payload(token)
     dead = []
-    for ws in list(directories):
+
+    for ws in list(directories[token]):
         try:
             await ws.send_text(payload)
         except Exception:
             dead.append(ws)
+
     for ws in dead:
-        directories.discard(ws)
+        directories[token].discard(ws)
 
 @app.websocket("/ws")
 async def ws_endpoint(
@@ -44,26 +61,25 @@ async def ws_endpoint(
     token: str = Query(...),
     name: str = Query("")
 ):
-    if token != TOKEN:
-        await ws.close(code=1008)
+    if token not in ALLOWED_TOKENS:
+        await ws.close(code=4403)
         return
 
     await ws.accept()
 
     if role == "directory":
-        directories.add(ws)
+        directories[token].add(ws)
         try:
-            await ws.send_text(await directory_payload())
+            await ws.send_text(await directory_payload(token))
             while True:
-                # Keep the socket alive; optional refresh messages are accepted.
                 await ws.receive_text()
-                await ws.send_text(await directory_payload())
+                await ws.send_text(await directory_payload(token))
         except WebSocketDisconnect:
             pass
         except Exception:
             pass
         finally:
-            directories.discard(ws)
+            directories[token].discard(ws)
         return
 
     if not device:
@@ -72,56 +88,67 @@ async def ws_endpoint(
 
     if role == "sender":
         async with lock:
-            old = senders.get(device)
+            old = senders[token].get(device)
             if old and old is not ws:
                 try:
                     await old.close(code=1012)
                 except Exception:
                     pass
-            senders[device] = ws
-            sender_names[device] = name or device
-        await broadcast_directory()
+
+            senders[token][device] = ws
+            sender_names[token][device] = name or device
+
+        await broadcast_directory(token)
 
         try:
             while True:
                 msg = await ws.receive()
+
                 if msg.get("bytes") is not None:
                     dead = []
-                    for v in list(viewers[device]):
+                    for v in list(viewers[token][device]):
                         try:
                             await v.send_bytes(msg["bytes"])
                         except Exception:
                             dead.append(v)
+
                     for v in dead:
-                        viewers[device].discard(v)
+                        viewers[token][device].discard(v)
+
                 elif msg.get("text") is not None:
                     dead = []
-                    for v in list(viewers[device]):
+                    for v in list(viewers[token][device]):
                         try:
                             await v.send_text(msg["text"])
                         except Exception:
                             dead.append(v)
+
                     for v in dead:
-                        viewers[device].discard(v)
+                        viewers[token][device].discard(v)
+
         except WebSocketDisconnect:
             pass
         except Exception:
             pass
         finally:
             async with lock:
-                if senders.get(device) is ws:
-                    senders.pop(device, None)
-                    sender_names.pop(device, None)
-            await broadcast_directory()
+                if senders[token].get(device) is ws:
+                    senders[token].pop(device, None)
+                    sender_names[token].pop(device, None)
+
+            await broadcast_directory(token)
 
     elif role == "viewer":
-        viewers[device].add(ws)
+        viewers[token][device].add(ws)
+
         try:
             while True:
                 msg = await ws.receive()
-                s = senders.get(device)
+                s = senders[token].get(device)
+
                 if not s:
                     continue
+
                 try:
                     if msg.get("text") is not None:
                         await s.send_text(msg["text"])
@@ -129,11 +156,13 @@ async def ws_endpoint(
                         await s.send_bytes(msg["bytes"])
                 except Exception:
                     pass
+
         except WebSocketDisconnect:
             pass
         except Exception:
             pass
         finally:
-            viewers[device].discard(ws)
+            viewers[token][device].discard(ws)
+
     else:
         await ws.close(code=1008)
